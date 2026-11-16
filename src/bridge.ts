@@ -30,13 +30,15 @@ interface JsonRpcNotification extends JsonRpcBase {
 type JsonRpcMessage = JsonRpcRequest | JsonRpcResponse | JsonRpcNotification
 
 /**
- * Validates that a JSON.parse result is a JSON-RPC message
+ * Recognizes a JSON.parse result using a shallow JSON-RPC envelope check
  *
- * Requires the jsonrpc field to be '2.0' and a request, response, or notification shape.
+ * Requires a non-null, non-array object with jsonrpc '2.0' and either a numeric/string
+ * id or a string method. Other fields, including params, result, and error, are not
+ * validated; this does not enforce full JSON-RPC request/response/notification shapes.
  * @param data Unvalidated data from JSON.parse
- * @returns The message if valid, otherwise null
+ * @returns The original message if the shallow check passes, otherwise null
  */
-function parseJsonRpcMessage(data: unknown): JsonRpcMessage | null {
+export function parseJsonRpcMessage(data: unknown): JsonRpcMessage | null {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     return null
   }
@@ -44,9 +46,6 @@ function parseJsonRpcMessage(data: unknown): JsonRpcMessage | null {
   if (obj.jsonrpc !== '2.0') {
     return null
   }
-  // Request: has method and id
-  // Response: has id and no method
-  // Notification: has method and no id
   const hasId =
     'id' in obj &&
     (typeof obj.id === 'number' || typeof obj.id === 'string')
@@ -76,9 +75,9 @@ function isJsonRpcResponse(msg: JsonRpcMessage): msg is JsonRpcResponse {
 }
 
 /**
- * Parses a JSON string and validates it as a JSON-RPC message without throwing
+ * Parses a JSON string and applies the shallow JSON-RPC envelope check without throwing
  * @param line The JSON string to parse
- * @returns The JsonRpcMessage, or null if parsing or validation fails
+ * @returns The JsonRpcMessage, or null if parsing or the shallow check fails
  */
 function tryParseJsonRpcLine(line: string): JsonRpcMessage | null {
   try {
