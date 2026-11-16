@@ -47,8 +47,7 @@ export function parseJsonRpcMessage(data: unknown): JsonRpcMessage | null {
     return null
   }
   const hasId =
-    'id' in obj &&
-    (typeof obj.id === 'number' || typeof obj.id === 'string')
+    'id' in obj && (typeof obj.id === 'number' || typeof obj.id === 'string')
   const hasMethod = 'method' in obj && typeof obj.method === 'string'
   return hasId || hasMethod ? (data as JsonRpcMessage) : null
 }
@@ -107,6 +106,12 @@ export interface BridgeOptions {
 
 const MAX_PENDING_QUEUE_SIZE = 500
 
+/** How a replayed initialize request ended */
+type InitReplayOutcome = 'ok' | 'failed' | 'timeout' | 'exited'
+
+const CHILD_EXITED_MESSAGE =
+  'chrome-devtools-mcp exited before responding. The request was not retried because it may already have had side effects.'
+
 /**
  * stdio proxy bridge for chrome-devtools-mcp
  *
@@ -131,8 +136,10 @@ export class Bridge {
 
   /** Buffered initialize request from the client (replayed on reconnect) */
   private initRequest: string | null = null
-  /** id of the initialize request (used to suppress the duplicate response to the client) */
+  /** id of the initialize request (used to recognize its response from the child) */
   private initRequestId: number | string | null = null
+  /** Whether a response to the buffered initialize request has been written to the client */
+  private initResponseDelivered = false
   /** Buffered notifications/initialized message from the client (replayed on reconnect) */
   private initializedNotif: string | null = null
 
@@ -141,8 +148,12 @@ export class Bridge {
 
   /** Whether the bridge is waiting for the initialize response from the child */
   private waitingForInitResponse = false
-  /** Called when the initialize response is received */
-  private initResponseCallback: (() => void) | null = null
+  /** Called when the replayed initialize request ends */
+  private initResponseCallback: ((outcome: InitReplayOutcome) => void) | null =
+    null
+
+  /** Ids of client requests written to the current child that it has not answered yet */
+  private inFlight = new Set<number | string>()
 
   /**
    * Cached result of resolving the chrome-devtools-mcp launch command
@@ -310,7 +321,10 @@ export class Bridge {
       process.stderr.write(
         '[bridge] chrome-devtools-mcp not in PATH, using npx\n'
       )
-      this.resolvedCmd = { cmd: 'npx', baseArgs: ['-y', 'chrome-devtools-mcp'] }
+      this.resolvedCmd = {
+        cmd: 'npx',
+        baseArgs: ['-y', 'chrome-devtools-mcp'],
+      }
     }
 
     return this.resolvedCmd
@@ -331,6 +345,8 @@ export class Bridge {
     })
 
     this.childAlive = true
+    const inFlight = new Set<number | string>()
+    this.inFlight = inFlight
 
     // Do not crash on stdin write errors (e.g. ERR_STREAM_DESTROYED)
     if (this.child.stdin) {
@@ -344,7 +360,7 @@ export class Bridge {
     if (this.child.stdout) {
       const rl = createInterface({ input: this.child.stdout })
       rl.on('line', (line) => {
-        this.handleChildOutput(line)
+        this.handleChildOutput(line, inFlight)
       })
       // Close readline when the child exits to avoid leaking it
       this.child.once('exit', () => {
@@ -357,11 +373,13 @@ export class Bridge {
       this.childAlive = false
       this.child = null
 
+      this.failInFlightRequests(inFlight)
+
       // If the child exits while waiting during a reconnect (e.g. a premature reconnect
       // where Chrome went down again), release the wait now instead of waiting for the initialize timeout
       if (this.waitingForInitResponse) {
         this.waitingForInitResponse = false
-        this.initResponseCallback?.()
+        this.initResponseCallback?.('exited')
         this.initResponseCallback = null
       }
 
@@ -384,26 +402,58 @@ export class Bridge {
   /**
    * Handles an output line from the child process
    *
-   * Suppresses the initialize response during a reconnect (the client already received one).
-   * Everything else is forwarded to the client.
+   * Forwards the initialize response unless the client already received one (a replay
+   * duplicate), and settles a pending initialize replay. Other lines are forwarded as is.
+   * Lines are parsed only while the initialize response or an in-flight request still needs tracking.
    * @param line A JSON-RPC message line received from the child
+   * @param inFlight Ids of requests written to the child that emitted this line
    */
-  private handleChildOutput(line: string): void {
-    if (this.waitingForInitResponse && this.initRequestId !== null) {
+  private handleChildOutput(
+    line: string,
+    inFlight: Set<number | string>
+  ): void {
+    const trackingInit =
+      this.initRequestId !== null &&
+      (!this.initResponseDelivered || this.waitingForInitResponse)
+
+    if (trackingInit || inFlight.size > 0) {
       const msg = tryParseJsonRpcLine(line)
-      if (msg && isJsonRpcResponse(msg) && msg.id === this.initRequestId) {
-        // Suppress it: the client already received one
-        this.waitingForInitResponse = false
-        process.stderr.write(
-          '[bridge] Received initialize response (suppressed, not forwarded to Claude)\n'
-        )
-        this.initResponseCallback?.()
-        this.initResponseCallback = null
-        return
+      if (msg && isJsonRpcResponse(msg)) {
+        if (trackingInit && msg.id === this.initRequestId) {
+          this.handleInitializeResponse(line, msg)
+          return
+        }
+        inFlight.delete(msg.id)
       }
     }
 
     process.stdout.write(line + '\n')
+  }
+
+  /**
+   * Handles the child's response to the buffered initialize request
+   *
+   * Forwards it when the client has not received a response yet, otherwise suppresses
+   * it as a replay duplicate, and then settles a pending replay wait.
+   * @param line The raw response line
+   * @param msg The parsed response
+   */
+  private handleInitializeResponse(line: string, msg: JsonRpcResponse): void {
+    if (this.initResponseDelivered) {
+      process.stderr.write(
+        '[bridge] Received initialize response (suppressed, client already received one)\n'
+      )
+    } else {
+      this.initResponseDelivered = true
+      process.stdout.write(line + '\n')
+    }
+
+    if (!this.waitingForInitResponse) {
+      return
+    }
+    this.waitingForInitResponse = false
+    this.initResponseCallback?.(msg.error === undefined ? 'ok' : 'failed')
+    this.initResponseCallback = null
   }
 
   private setupStdinProxy(): void {
@@ -429,15 +479,52 @@ export class Bridge {
     if (!isJsonRpcRequest(msg) || msg.method === 'initialize') {
       return
     }
+    this.sendError(
+      msg.id,
+      'Chrome is not connected. Waiting for Chrome to restart.'
+    )
+  }
+
+  /**
+   * Writes a JSON-RPC error response to the client
+   * @param id The id of the request being answered
+   * @param message The error message
+   */
+  private sendError(id: number | string, message: string): void {
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
-      id: msg.id,
-      error: {
-        code: -32_000,
-        message: 'Chrome is not connected. Waiting for Chrome to restart.',
-      },
+      id,
+      error: { code: -32_000, message },
     }
     process.stdout.write(JSON.stringify(response) + '\n')
+  }
+
+  /**
+   * Answers every request the exited child never responded to with an error
+   *
+   * The requests are not replayed because they may already have had side effects.
+   * @param inFlight Ids of requests written to the exited child
+   */
+  private failInFlightRequests(inFlight: Set<number | string>): void {
+    for (const id of inFlight) {
+      process.stderr.write(
+        `[bridge] Child exited before responding to request ${String(id)}\n`
+      )
+      this.sendError(id, CHILD_EXITED_MESSAGE)
+    }
+    inFlight.clear()
+  }
+
+  /**
+   * Records a request that was written to the current child so it can be failed if the child exits
+   *
+   * Initialize is not tracked: a replayed initialize is settled by the reconnect itself.
+   * @param msg The parsed message that was written, or null if it was not valid JSON-RPC
+   */
+  private trackInFlight(msg: JsonRpcMessage | null): void {
+    if (msg && isJsonRpcRequest(msg) && msg.method !== 'initialize') {
+      this.inFlight.add(msg.id)
+    }
   }
 
   /**
@@ -454,6 +541,7 @@ export class Bridge {
       if (isJsonRpcRequest(msg) && msg.method === 'initialize') {
         this.initRequest = line
         this.initRequestId = msg.id
+        this.initResponseDelivered = false
         process.stderr.write('[bridge] Buffered initialize request\n')
       }
       if ('method' in msg && msg.method === 'notifications/initialized') {
@@ -482,6 +570,7 @@ export class Bridge {
 
     if (this.child?.stdin) {
       this.child.stdin.write(line + '\n')
+      this.trackInFlight(msg)
     } else {
       // The child is not running (e.g. it exited while Chrome was unreachable): answer requests with an error to keep the session alive
       if (msg) {
@@ -523,30 +612,36 @@ export class Bridge {
 
       this.spawnChild()
       const child = this.child
+      let replayedInitLine: string | null = null
 
       if (this.initRequest && child?.stdin) {
         process.stderr.write('[bridge] Replaying initialize to child\n')
-        child.stdin.write(this.initRequest + '\n')
+        replayedInitLine = this.initRequest
+        child.stdin.write(replayedInitLine + '\n')
 
-        await new Promise<void>((resolve) => {
+        const outcome = await new Promise<InitReplayOutcome>((resolve) => {
           const timeout = setTimeout(() => {
             this.waitingForInitResponse = false
             this.initResponseCallback = null
             process.stderr.write(
               '[bridge] Timed out waiting for initialize response\n'
             )
-            resolve()
+            resolve('timeout')
           }, 10_000)
 
           this.waitingForInitResponse = true
-          this.initResponseCallback = () => {
+          this.initResponseCallback = (result) => {
             clearTimeout(timeout)
-            resolve()
+            resolve(result)
           }
         })
 
-        // Replay notifications/initialized (child.stdin may have closed during the await, so check writable)
-        if (this.initializedNotif && child.stdin.writable) {
+        // Replay notifications/initialized only after a successful initialize (child.stdin may have closed during the await, so check writable)
+        if (outcome !== 'ok') {
+          process.stderr.write(
+            `[bridge] Initialize replay ended with "${outcome}". Not replaying notifications/initialized\n`
+          )
+        } else if (this.initializedNotif && child.stdin.writable) {
           process.stderr.write(
             '[bridge] Replaying notifications/initialized to child\n'
           )
@@ -558,8 +653,12 @@ export class Bridge {
       const pending = [...this.pendingQueue]
       this.pendingQueue = []
       for (const pendingLine of pending) {
+        if (pendingLine === replayedInitLine) {
+          continue
+        }
         if (this.child?.stdin?.writable) {
           this.child.stdin.write(pendingLine + '\n')
+          this.trackInFlight(tryParseJsonRpcLine(pendingLine))
         } else {
           const parsed = tryParseJsonRpcLine(pendingLine)
           if (parsed) {
